@@ -24,7 +24,7 @@ from .departure import (
 )
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -203,7 +203,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Chery Europe switches from a config entry."""
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities: list[SwitchEntity] = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
@@ -211,21 +211,26 @@ async def async_setup_entry(
         entities.extend(
             CheryEuropeCommandSwitch(coordinator, description, entry)
             for description in SWITCH_DESCRIPTIONS
-            if keep_feature(perms, description.key, f"{vin}_{description.key}", removed)
+            if keep_feature(perms, description.key, f"{vin}_{description.key}", unsupported)
         )
-        if keep_feature(perms, "charging_switch", f"{vin}_charging_switch", removed):
+        if keep_feature(perms, "charging_switch", f"{vin}_charging_switch", unsupported):
             entities.append(CheryEuropeChargeSwitch(coordinator, entry))
-        if keep_feature(perms, "scheduled_charging", f"{vin}_scheduled_charging", removed):
+        if keep_feature(perms, "scheduled_charging", f"{vin}_scheduled_charging", unsupported):
             entities.append(CheryEuropeScheduledChargeSwitch(coordinator, entry))
-        if keep_feature(perms, "departure", f"{vin}_departure", removed):
+        if keep_feature(perms, "departure", f"{vin}_departure", unsupported):
             entities.append(CheryEuropeDepartureSwitch(coordinator, entry))
         entities.extend(
             CheryEuropeDepartureDaySwitch(coordinator, description, entry, day)
             for day, description in DEPARTURE_DAY_DESCRIPTIONS
-            if keep_feature(perms, description.key, f"{vin}_{description.key}", removed)
+            if keep_feature(perms, description.key, f"{vin}_{description.key}", unsupported)
         )
         entities.append(CheryEuropePollingSwitch(coordinator, entry))
-    async_remove_unsupported(hass, SWITCH, removed)
+    async_sync_unsupported(
+        hass,
+        SWITCH,
+        entities,
+        unsupported,
+    )
     async_add_entities(entities)
 
 

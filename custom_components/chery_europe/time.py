@@ -18,7 +18,7 @@ from .coordinator import CheryEuropeDataUpdateCoordinator
 from .departure import async_set_departure, departure_state
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -51,17 +51,22 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Chery Europe time entities from a config entry."""
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
         vin = vehicle_uid(coordinator, entry)
-        if keep_feature(perms, CHARGE_START_TIME_DESCRIPTION.key, f"{vin}_charge_start_time", removed):
+        if keep_feature(perms, CHARGE_START_TIME_DESCRIPTION.key, f"{vin}_charge_start_time", unsupported):
             entities.append(CheryEuropeChargeStartTime(coordinator, entry))
-        if keep_feature(perms, DEPARTURE_TIME_DESCRIPTION.key, f"{vin}_departure_time", removed):
+        if keep_feature(perms, DEPARTURE_TIME_DESCRIPTION.key, f"{vin}_departure_time", unsupported):
             entities.append(CheryEuropeDepartureTime(coordinator, entry))
     async_add_entities(entities)
-    async_remove_unsupported(hass, TIME, removed)
+    async_sync_unsupported(
+        hass,
+        TIME,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeChargeStartTime(CheryEuropeEntity, TimeEntity, RestoreEntity):

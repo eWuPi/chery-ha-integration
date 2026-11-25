@@ -18,7 +18,7 @@ from .const import NUMBER
 from .coordinator import CheryEuropeDataUpdateCoordinator
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -48,7 +48,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Chery Europe number entities from a config entry."""
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
@@ -57,11 +57,16 @@ async def async_setup_entry(
             perms,
             CHARGE_DURATION_DESCRIPTION.key,
             f"{vin}_charge_duration_hours",
-            removed,
+            unsupported,
         ):
             entities.append(CheryEuropeChargeDurationNumber(coordinator, entry))
     async_add_entities(entities)
-    async_remove_unsupported(hass, NUMBER, removed)
+    async_sync_unsupported(
+        hass,
+        NUMBER,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeChargeDurationNumber(CheryEuropeEntity, RestoreNumber):

@@ -18,7 +18,7 @@ from .const import (
 from .coordinator import CheryEuropeDataUpdateCoordinator
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -61,15 +61,20 @@ async def async_setup_entry(
         supports_response=SupportsResponse.NONE,
     )
 
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
         vin = vehicle_uid(coordinator, entry)
-        if keep_feature(perms, LOCK_DESCRIPTION.key, f"{vin}_doors_lock", removed):
+        if keep_feature(perms, LOCK_DESCRIPTION.key, f"{vin}_doors_lock", unsupported):
             entities.append(CheryEuropeLock(coordinator, LOCK_DESCRIPTION, entry))
     async_add_entities(entities)
-    async_remove_unsupported(hass, LOCK, removed)
+    async_sync_unsupported(
+        hass,
+        LOCK,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeLock(CheryEuropeEntity, LockEntity):

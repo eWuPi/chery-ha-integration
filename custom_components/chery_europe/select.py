@@ -17,7 +17,7 @@ from .data import SEAT_FIELD_TO_ATTR, CheryData
 from .entity import (
     CheryEuropeEntity,
     async_remove_moved_entities,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -84,7 +84,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Chery Europe selects from a config entry."""
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities: list[SelectEntity] = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
@@ -96,18 +96,23 @@ async def async_setup_entry(
                 perms,
                 description.key,
                 f"{vin}_{description.key}_{description.middle_option}_select",
-                removed,
+                unsupported,
             )
         )
         for description in SEAT_SELECT_DESCRIPTIONS:
             suffix = f"{description.key}{SEAT_SELECT_SUFFIX}"
-            if keep_feature(perms, description.key, f"{vin}_{suffix}", removed):
+            if keep_feature(perms, description.key, f"{vin}_{suffix}", unsupported):
                 entities.append(CheryEuropeSeatSelect(coordinator, description, entry))
     # The seat level controls used to be switches; drop those registry entries so
     # they do not stay behind as unavailable orphans next to the new selects.
     async_remove_moved_entities(hass, entry, SWITCH, SEAT_SELECT_KEYS)
     async_add_entities(entities)
-    async_remove_unsupported(hass, SELECT, removed)
+    async_sync_unsupported(
+        hass,
+        SELECT,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeVentSelect(CheryEuropeEntity, SelectEntity):

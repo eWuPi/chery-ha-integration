@@ -5,6 +5,8 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
+from homeassistant.helpers import entity_registry as er
+
 from custom_components.chery_europe.const import CONF_PIN
 from custom_components.chery_europe.data import CheryData
 from custom_components.chery_europe.select import (
@@ -190,6 +192,7 @@ async def test_setup_moves_seat_switches_to_selects():
     entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator, options={})
     added: list = []
     removed: list = []
+    entries: dict = {}
     old_switch = SimpleNamespace(
         domain="switch",
         unique_id="entry-1_driver_seat_heating",
@@ -200,8 +203,11 @@ async def test_setup_moves_seat_switches_to_selects():
         unique_id="entry-1_driver_seat_heating_level_select",
         entity_id="select.driver_seat_heating",
     )
+    updates: list[tuple[str, dict]] = []
     registry = SimpleNamespace(
         async_get_entity_id=lambda domain, _platform, unique_id: f"{domain}.{unique_id}",
+        async_get=lambda entity_id: entries.get(entity_id),
+        async_update_entity=lambda entity_id, **kwargs: updates.append((entity_id, kwargs)),
         async_remove=lambda entity_id: removed.append(entity_id),
     )
 
@@ -220,7 +226,7 @@ async def test_setup_moves_seat_switches_to_selects():
 
 
 @pytest.mark.asyncio
-async def test_setup_omits_denied_seat_select():
+async def test_setup_creates_denied_seat_select_and_disables_it():
     from custom_components.chery_europe.select import async_setup_entry
 
     coordinator = SimpleNamespace(
@@ -231,8 +237,16 @@ async def test_setup_omits_denied_seat_select():
     entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator, options={})
     added: list = []
     removed: list = []
+    entries: dict = {
+        "select.entry-1_rear_left_seat_ventilation_level_select": SimpleNamespace(
+            disabled_by=None
+        )
+    }
+    updates: list[tuple[str, dict]] = []
     registry = SimpleNamespace(
         async_get_entity_id=lambda domain, _platform, unique_id: f"{domain}.{unique_id}",
+        async_get=lambda entity_id: entries.get(entity_id),
+        async_update_entity=lambda entity_id, **kwargs: updates.append((entity_id, kwargs)),
         async_remove=lambda entity_id: removed.append(entity_id),
     )
 
@@ -245,8 +259,16 @@ async def test_setup_omits_denied_seat_select():
     ):
         await async_setup_entry(Mock(), entry, lambda entities: added.extend(entities))
 
-    keys = {entity.entity_description.key for entity in added}
-    assert "rear_left_seat_ventilation" not in keys
-    assert "rear_right_seat_ventilation" in keys
-    # the denied select is cleaned up under its own unique id, not the old one
-    assert removed == ["select.entry-1_rear_left_seat_ventilation_level_select"]
+    denied = {
+        entity.entity_description.key
+        for entity in added
+        if entity._permission_denied
+    }
+    assert "rear_left_seat_ventilation" in denied
+    assert "rear_right_seat_ventilation" not in denied
+    # the denied select is disabled under its own unique id, not the old one
+    assert removed == []
+    assert (
+        "select.entry-1_rear_left_seat_ventilation_level_select",
+        {"disabled_by": er.RegistryEntryDisabler.INTEGRATION},
+    ) in updates

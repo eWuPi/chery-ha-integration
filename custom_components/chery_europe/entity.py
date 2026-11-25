@@ -18,6 +18,11 @@ class CheryEuropeEntity(CoordinatorEntity[CheryEuropeDataUpdateCoordinator]):
     """Base entity for Chery Europe."""
 
     _attr_has_entity_name = True
+    # Set by async_sync_unsupported when the backend denies this control for the
+    # vehicle.  The entity is still created, but disabled in the registry right
+    # after it is added: it keeps its entity id and its history and switches
+    # itself back on as soon as the permission returns.
+    _permission_denied = False
 
     def __init__(
         self,
@@ -62,6 +67,12 @@ class CheryEuropeEntity(CoordinatorEntity[CheryEuropeDataUpdateCoordinator]):
     def available(self) -> bool:
         """Return if entity is available."""
         return self.coordinator.last_update_success
+
+    async def async_added_to_hass(self) -> None:
+        """Disable a control the vehicle may not use instead of dropping it."""
+        await super().async_added_to_hass()
+        if self._permission_denied and self.entity_id:
+            _disable_entity(self.hass, self.entity_id)
 
 
 def control_permissions(coordinator: CheryEuropeDataUpdateCoordinator) -> dict[int, int]:
@@ -342,19 +353,67 @@ def _strip_vin(value: str, vin: str) -> str:
     return re.sub(r"[\s_\-]+", " ", cleaned).strip(" _-")
 
 
-def async_remove_unsupported(
+def async_sync_unsupported(
     hass: HomeAssistant,
     domain: str,
-    unique_ids: list[str],
+    entities: list[CheryEuropeEntity],
+    unsupported: list[str],
 ) -> None:
-    """Drop registry entries for controls this vehicle is not allowed to use."""
-    if not unique_ids:
-        return
+    """Disable the controls this vehicle may not use and re-enable the rest.
+
+    A denied control is created like every other one and only disabled in the
+    registry.  Skipping it, and even more so removing its registry entry, threw
+    the entity id, its customisations and its history away, and nothing brought
+    the control back when the backend reported the permission again -- a
+    permission that flips for a while cost the user the entity for good.
+    """
+    denied = set(unsupported)
     registry = er.async_get(hass)
-    for unique_id in unique_ids:
-        entity_id = registry.async_get_entity_id(domain, DOMAIN, unique_id)
-        if entity_id is not None:
-            registry.async_remove(entity_id)
+    for entity in entities:
+        unique_id = getattr(entity, "unique_id", None)
+        if not unique_id:
+            continue
+        if unique_id in denied:
+            entity._permission_denied = True
+            _store_disabled_by(
+                registry, domain, unique_id, er.RegistryEntryDisabler.INTEGRATION
+            )
+        else:
+            _store_disabled_by(registry, domain, unique_id, None)
+
+
+def _disable_entity(hass: HomeAssistant, entity_id: str) -> None:
+    """Disable one registry entry the integration created for a denied control."""
+    registry = er.async_get(hass)
+    entry = registry.async_get(entity_id)
+    if entry is None or entry.disabled_by is not None:
+        return
+    registry.async_update_entity(
+        entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION
+    )
+
+
+def _store_disabled_by(
+    registry: er.EntityRegistry,
+    domain: str,
+    unique_id: str,
+    disabled_by: er.RegistryEntryDisabler | None,
+) -> None:
+    """Set the registry flag, but never overrule a choice the user made."""
+    entity_id = registry.async_get_entity_id(domain, DOMAIN, unique_id)
+    if entity_id is None:
+        return
+    entry = registry.async_get(entity_id)
+    if entry is None or entry.disabled_by is disabled_by:
+        return
+    if disabled_by is None:
+        # Only clear the flag this integration set itself.
+        if entry.disabled_by is not er.RegistryEntryDisabler.INTEGRATION:
+            return
+    elif entry.disabled_by is not None:
+        # Already disabled by the user: leave that decision alone.
+        return
+    registry.async_update_entity(entity_id, disabled_by=disabled_by)
 
 
 def async_remove_moved_entities(
@@ -380,11 +439,14 @@ def keep_feature(
     perms: dict[int, int],
     key: str,
     unique_id: str,
-    removed: list[str],
+    unsupported: list[str],
 ) -> bool:
-    """Return True when the entity should be created, else queue its unique id."""
-    if feature_enabled(perms, key):
-        return True
-    if perms:
-        removed.append(unique_id)
-    return False
+    """Always create the entity; queue its unique id when it may not be used.
+
+    The entity is created even for a denied control: a skipped entity leaves no
+    registry entry behind, so a control that was dropped once could never come
+    back.  ``async_sync_unsupported`` disables it right after it is added.
+    """
+    if not feature_enabled(perms, key):
+        unsupported.append(unique_id)
+    return True

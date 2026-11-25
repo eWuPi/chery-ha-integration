@@ -20,7 +20,7 @@ from .const import (
 from .coordinator import CheryEuropeDataUpdateCoordinator
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -83,15 +83,20 @@ async def async_setup_entry(
         supports_response=SupportsResponse.NONE,
     )
 
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
         vin = vehicle_uid(coordinator, entry)
-        if keep_feature(perms, CLIMATE_DESCRIPTION.key, f"{vin}_hvac_climate", removed):
+        if keep_feature(perms, CLIMATE_DESCRIPTION.key, f"{vin}_hvac_climate", unsupported):
             entities.append(CheryEuropeClimate(coordinator, CLIMATE_DESCRIPTION, entry))
     async_add_entities(entities)
-    async_remove_unsupported(hass, CLIMATE, removed)
+    async_sync_unsupported(
+        hass,
+        CLIMATE,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeClimate(CheryEuropeEntity, ClimateEntity):
