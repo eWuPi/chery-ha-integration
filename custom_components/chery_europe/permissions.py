@@ -30,6 +30,9 @@ ENDPOINT_CATEGORY = {
     "findCar": 202,
     "vehicleLocation": 211,
     "theftAlarm": 401,
+    # travelAppointControl (scheduled cabin/battery preparation) is deliberately
+    # unmapped: the app does not expose its permission category, and an unmapped
+    # endpoint fails open instead of blocking a legitimate command.
 }
 
 PRUNABLE_FIELDS = {
@@ -103,6 +106,7 @@ FEATURE_VOICES: dict[str, tuple[int, ...]] = {
     "scheduled_charging": (213,),
     "charge_start_time": (213,),
     "charge_duration_hours": (213,),
+    "charge_end_time": (213,),
     "windows": (206,),
     "sunroof": (207,),
     "trunk": (205,),

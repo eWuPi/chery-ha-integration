@@ -22,7 +22,7 @@ from .coordinator import CheryEuropeDataUpdateCoordinator
 from .data import CheryData
 from .entity import (
     CheryEuropeEntity,
-    async_remove_unsupported,
+    async_sync_unsupported,
     control_permissions,
     iter_entry_coordinators,
     keep_feature,
@@ -60,7 +60,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Chery Europe covers from a config entry."""
-    removed: list[str] = []
+    unsupported: list[str] = []
     entities = []
     for coordinator in iter_entry_coordinators(entry):
         perms = control_permissions(coordinator)
@@ -68,10 +68,15 @@ async def async_setup_entry(
         entities.extend(
             CheryEuropeCover(coordinator, description, entry)
             for description in COVER_DESCRIPTIONS
-            if keep_feature(perms, description.key, f"{vin}_{description.key}_cover", removed)
+            if keep_feature(perms, description.key, f"{vin}_{description.key}_cover", unsupported)
         )
     async_add_entities(entities)
-    async_remove_unsupported(hass, COVER, removed)
+    async_sync_unsupported(
+        hass,
+        COVER,
+        entities,
+        unsupported,
+    )
 
 
 class CheryEuropeCover(CheryEuropeEntity, CoverEntity):

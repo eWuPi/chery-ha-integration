@@ -1,15 +1,16 @@
-from dataclasses import replace
-from datetime import timedelta
 import asyncio
+import json
 import logging
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import CheryEuropeApi
 from .const import (
@@ -21,11 +22,18 @@ from .const import (
     DEFAULT_POLL_CHARGING_MIN,
     DEFAULT_POLL_HV_MIN,
     DEFAULT_POLL_NORMAL_MIN,
-    DEFAULT_SCAN_INTERVAL,
     DEFAULT_SESSION_KEEPALIVE,
     DOMAIN,
     DRIVE_WATCH_INTERVAL,
+    MESSAGES_BACKFILL_MAX_PAGES,
+    MESSAGES_BACKFILL_PAGE_SIZE,
+    MESSAGES_POLL_INTERVAL,
+    MESSAGES_POLL_PAGE_SIZE,
+    MESSAGES_RESCAN_INTERVAL,
+    NO_COMMAND_ERROR,
+    NON_CONTROL_COMMAND_IDS,
     POST_COMMAND_REFRESH_DELAYS,
+    PREPARE_POLL_INTERVAL,
     REFRESH_HV_WAIT_SECONDS,
     STATUS_MAX_LEN,
 )
@@ -34,15 +42,28 @@ from .data import (
     apply_charge_appointment,
     apply_data_freshness,
     apply_location,
+    apply_messages,
+    apply_travel_appointment,
     is_command_ack,
     merge_chery_data,
     vehicle_display_name,
 )
-from .exceptions import CheryEuropeAuthError, CheryEuropeCommandError, CheryEuropeException
+from .exceptions import (
+    CheryEuropeAuthError,
+    CheryEuropeCommandError,
+    CheryEuropeException,
+)
+from .message_history import MessageHistory
+from .messages import parse_messages, unread_count, unread_messages
 from .mqtt import CheryEuropeMqttClient
 from .pin import resolve_pin
+from .vehicle_commands import DEFAULT_AIR_DURATION
 
 _LOGGER = logging.getLogger(__name__)
+
+# The reply sensor keeps an excerpt, not megabytes of telemetry: a status push
+# is easily 100 kB and the attributes are stored in the recorder.
+MQTT_REPLY_MAX_CHARS = 1500
 
 
 def _vehicle_vin(vehicle: object) -> str | None:
@@ -76,6 +97,7 @@ def _payload_vin(payload: dict) -> str | None:
             return str(value)
     return None
 
+
 _CONTROL_STATE_FIELDS = (
     "is_locked",
     "is_charging",
@@ -100,6 +122,12 @@ _CONTROL_STATE_FIELDS = (
     "rear_left_seat_ventilation",
     "rear_right_seat_ventilation",
     "theft_alarm",
+    "prepare_plans",
+    "prepare_next_departure",
+    "messages",
+    "messages_total",
+    "messages_unread",
+    "messages_polled_at",
 )
 
 
@@ -120,6 +148,9 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         owns_account_session: bool = True,
     ) -> None:
         self.api = api
+        # Every vehicle command outcome, for the diagnostics error entities.
+        if hasattr(api, "command_result_callbacks"):
+            api.command_result_callbacks.append(self._handle_command_result)
         self.entry = entry
         self.vin_filter = vin
         self.entity_slot = entity_slot
@@ -127,10 +158,27 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         self.rename_entry = rename_entry
         self.owns_account_session = owns_account_session
         self.permissions: dict[int, int] = {}
+        self._prepare_polled_at: datetime | None = None
+        self._messages_polled_at: datetime | None = None
+        self._messages_rescanned_at: datetime | None = None
+        # Created on the first inbox poll so a failed setup costs nothing.
+        self._message_history: MessageHistory | None = None
         self._permissions_loaded = False
         self._mqtt_siblings: list = []
         self.charge_start_minutes = 480
+        self.departure_draft: str | None = None
+        self.departure_days: list[int] | None = None
+        self.departure_armed: bool | None = None
+        # Parameters the quick "departure in 15 minutes" button replaced, so a
+        # second press can put the plan back the way the owner had it.
+        self.departure_previous: dict[str, Any] | None = None
         self.charge_duration_hours = 6
+        # airControl "times" (minutes) used by the climate entity after a
+        # remote start; set from select.<vehicle>_czas_pracy_klimatyzacji.
+        self.hvac_duration = DEFAULT_AIR_DURATION
+        # Start, duration and end time share one window: whatever one of them
+        # writes, the other two have to render again.
+        self.charge_schedule_listeners: list = []
         self.poll_enabled = True
         self._mqtt: CheryEuropeMqttClient | None = None
         self._watch_unsub = None
@@ -168,6 +216,32 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         }
         if updates:
             self.async_set_updated_data(replace(self.data, **updates))
+
+    def _handle_command_result(
+        self, vin: str, command_id: str, result: dict[str, Any]
+    ) -> None:
+        """Keep the last refused command for the diagnostics error entities.
+
+        The response code alone says nothing to a human ("A00082"), so the code
+        and its readable text are stored side by side; a command that goes
+        through puts both back to ``brak`` so a stale failure is never shown.
+        """
+        if self.vin_filter and vin and vin != self.vin_filter:
+            return
+        if result.get("ok"):
+            if command_id in NON_CONTROL_COMMAND_IDS:
+                return
+            self._update_status(
+                command_error_code=NO_COMMAND_ERROR,
+                command_error_text=NO_COMMAND_ERROR,
+            )
+            return
+        code = result.get("code")
+        text = result.get("message") or "kod bez opisu"
+        self._update_status(
+            command_error_code=str(code) if code else "brak kodu",
+            command_error_text=text,
+        )
 
     async def _async_update_data(self) -> CheryData:
         """Fetch the latest data from Chery Europe."""
@@ -214,13 +288,16 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
                 self._apply_scan_interval(base)
                 base = await self._merge_charge_appointment(base)
                 base = await self._merge_theft_alarm(base)
+                base = await self._merge_messages(base)
                 return self._publish_data(base)
             if not realtime:
                 self._sync_vehicle_identity(base)
                 self._apply_scan_interval(base)
                 merged = await self._merge_location(base)
                 merged = await self._merge_charge_appointment(merged)
+                merged = await self._merge_travel_appointment(merged)
                 merged = await self._merge_theft_alarm(merged)
+                merged = await self._merge_messages(merged)
                 return self._publish_data(merged)
             merged = merge_chery_data(
                 base,
@@ -228,7 +305,9 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
             )
             merged = await self._merge_location(merged)
             merged = await self._merge_charge_appointment(merged)
+            merged = await self._merge_travel_appointment(merged)
             merged = await self._merge_theft_alarm(merged)
+            merged = await self._merge_messages(merged)
             self._sync_vehicle_identity(merged)
             self._apply_scan_interval(merged)
             return self._publish_data(merged)
@@ -250,7 +329,13 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         if current is None:
             return data
         preserved = {}
-        for field in ("command_status", "wake_status", "probe_status"):
+        for field in (
+            "command_status",
+            "command_error_code",
+            "command_error_text",
+            "wake_status",
+            "probe_status",
+        ):
             value = getattr(current, field)
             if value is not None and getattr(data, field) is None:
                 preserved[field] = value
@@ -283,7 +368,10 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         device_key = self.device_id or entry_id
         if not device_key:
             return
-        device = device_registry.async_get_device(identifiers={(DOMAIN, device_key)})
+        # Imported here: entity.py imports this module, so a top-level import cycles.
+        from .entity import async_device_by_identifier
+
+        device = async_device_by_identifier(device_registry, device_key, entry_id)
         if device is not None and device.name != name:
             device_registry.async_update_device(device.id, name=name)
 
@@ -312,6 +400,13 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
     def schedule_refresh_after_command(self) -> None:
         """Schedule post-command refreshes without failing the caller."""
         self.hass.async_create_task(self._refresh_after_command_safe())
+
+    def async_notify_charge_schedule(self) -> None:
+        """Push a changed charge window to the start, duration and end entities."""
+        for entity in list(self.charge_schedule_listeners):
+            if getattr(entity, "entity_id", None) is None:
+                continue
+            entity.async_write_ha_state()
 
     def schedule_location_refresh(self) -> None:
         """Poll queryVehicleLocation after a locate command until GPS arrives."""
@@ -348,6 +443,277 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
             _LOGGER.debug("Charge appointment unavailable for %s: %s", data.vin, exc)
             return data
         return apply_charge_appointment(data, result)
+
+    async def _merge_travel_appointment(self, data: CheryData) -> CheryData:
+        """Read the scheduled cabin/battery preparation plans.
+
+        Polled at most every ``PREPARE_POLL_INTERVAL`` so a short HV poll
+        interval does not multiply the requests sent to the account. A failed
+        query keeps the last plan list.
+        """
+        if not data.vin:
+            return data
+        now = datetime.now(UTC)
+        last = self._prepare_polled_at
+        if last is not None and now - last < PREPARE_POLL_INTERVAL:
+            return data
+        query = getattr(self.api, "query_travel_appointment", None)
+        if query is None:
+            return data
+        try:
+            plans = await query(data.vin)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Travel appointment unavailable for %s: %s", data.vin, exc)
+            return data
+        self._prepare_polled_at = now
+        if plans is None:
+            return data
+        # An empty list is a real answer from travelQuery (no departure plans).
+        # ``None`` above is the failure case and keeps the last list.
+        return apply_travel_appointment(data, plans, polled_at=now.isoformat())
+
+    def invalidate_prepare_cache(self) -> None:
+        """Force the next update to re-read the plans after we wrote them."""
+        self._prepare_polled_at = None
+
+    async def _fetch_all_messages(self) -> tuple[list[dict], int | None, bool]:
+        """Read every inbox page once, newest first.
+
+        Returns the messages, the total the server reports and whether the read
+        completed.  Large pages are honoured by the endpoint, so a few hundred
+        messages cost three requests instead of one per ten entries.
+        """
+        fetch = getattr(self.api, "fetch_messages", None)
+        if fetch is None:
+            return [], None, False
+        messages: list[dict] = []
+        total: int | None = None
+        for page in range(1, MESSAGES_BACKFILL_MAX_PAGES + 1):
+            try:
+                payload = await fetch(page, MESSAGES_BACKFILL_PAGE_SIZE)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Vehicle messages page %s failed: %s", page, exc)
+                return messages, total, False
+            if payload is None:
+                return messages, total, False
+            chunk, page_total = parse_messages(payload)
+            if page_total is not None:
+                total = page_total
+            if not chunk:
+                break
+            messages.extend(chunk)
+            if total is not None and len(messages) >= total:
+                break
+            if len(chunk) < MESSAGES_BACKFILL_PAGE_SIZE:
+                break
+            await asyncio.sleep(1)
+        return messages, total, True
+
+    async def _merge_messages(self, data: CheryData) -> CheryData:
+        """Read the message inbox into a stored history.
+
+        The first run imports the complete inbox (a few large pages) so the
+        whole conversation is available afterwards; later cycles only read the
+        newest page and merge it by message id, at most every
+        ``MESSAGES_POLL_INTERVAL``.  The cloud ``getUnread`` flag is compared
+        with the locally counted unread entries -- messages read in the phone
+        app flip their flag in the cloud, so a contradiction triggers one full
+        rescan, at most once per ``MESSAGES_RESCAN_INTERVAL``.  A failed read
+        keeps the stored history and the last state.
+        """
+        if not getattr(self, "owns_account_session", True):
+            return await self._apply_shared_messages(data)
+
+        now = datetime.now(UTC)
+        last = self._messages_polled_at
+        if last is not None and now - last < MESSAGES_POLL_INTERVAL:
+            return data
+        fetch = getattr(self.api, "fetch_messages", None)
+        if fetch is None:
+            return data
+        history = self._message_history or self._create_message_history()
+        await history.async_load()
+        history.set_vin(data.vin)
+
+        fetched = False
+        total: int | None = None
+        # Keep importing the whole inbox until one pass finishes. A failed
+        # page used to leave a short history that later polls never extended,
+        # because only an empty store took the full-import path.
+        if history.is_empty or not history.backfilled_at:
+            messages, total, complete = await self._fetch_all_messages()
+            if messages:
+                fetched = True
+                history.merge(messages)
+                if complete:
+                    history.mark_backfilled(now.isoformat())
+            elif complete:
+                fetched = True
+                history.mark_backfilled(now.isoformat())
+        else:
+            try:
+                payload = await fetch(1, MESSAGES_POLL_PAGE_SIZE)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Vehicle messages unavailable: %s", exc)
+                payload = None
+            if payload is not None:
+                chunk, page_total = parse_messages(payload)
+                total = page_total
+                fetched = True
+                history.merge(chunk)
+
+        unread: bool | None = None
+        fetch_unread = getattr(self.api, "fetch_messages_unread", None)
+        if fetch_unread is not None:
+            try:
+                unread = await fetch_unread()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Unread messages flag unavailable: %s", exc)
+
+        local_unread = unread_count(history.messages)
+        if (
+            unread is not None
+            and bool(local_unread) != unread
+            and self._may_rescan(now)
+        ):
+            _LOGGER.debug(
+                "Unread flag (%s) disagrees with the stored history (%s); "
+                "re-reading the inbox",
+                unread,
+                local_unread,
+            )
+            messages, rescan_total, _complete = await self._fetch_all_messages()
+            self._messages_rescanned_at = now
+            if messages:
+                fetched = True
+                total = rescan_total or total
+                history.merge(messages)
+                local_unread = unread_count(history.messages)
+
+        # A failed read must not start the 30 minute throttle, or the first
+        # outage hides the inbox until the next interval.
+        if fetched:
+            self._messages_polled_at = now
+        await history.async_save()
+        items = history.messages
+        if not items and not fetched:
+            return data
+        if total is not None:
+            total = max(total, len(items))
+        return apply_messages(
+            data,
+            items,
+            total=total,
+            unread=unread,
+            unread_count=local_unread,
+            polled_at=now.isoformat() if fetched else None,
+            backfilled_at=history.backfilled_at,
+        )
+
+    async def async_messages_page(
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        *,
+        unread_only: bool = False,
+    ) -> dict[str, Any]:
+        """Return one page of the stored history; never asks the cloud."""
+        history = self._message_history or self._create_message_history()
+        await history.async_load()
+        items = unread_messages(history.messages) if unread_only else history.messages
+        total = len(items)
+        page_size = max(1, page_size)
+        pages = max(1, -(-total // page_size))
+        page = min(max(1, page), pages)
+        start = (page - 1) * page_size
+        return {
+            "total": total,
+            "page": page,
+            "pages": pages,
+            "page_size": page_size,
+            "backfilled_at": history.backfilled_at,
+            "messages": items[start : start + page_size],
+        }
+
+    async def async_mark_messages_read(self) -> bool:
+        """Mark the inbox read in the cloud and in the stored history.
+
+        Everything here is user triggered: one cloud call per button press,
+        then the local history is flagged in place so the unread entities drop
+        to zero right away instead of waiting for the next message poll.
+        """
+        mark = getattr(self.api, "mark_messages_read", None)
+        if mark is None:
+            return False
+        try:
+            accepted = await mark()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Marking the inbox read failed: %s", exc)
+            return False
+        if not accepted:
+            return False
+        history = self._message_history or self._create_message_history()
+        await history.async_load()
+        if history.mark_all_read():
+            await history.async_save()
+        data = self.data
+        if data is None:
+            return True
+        self.async_set_updated_data(
+            apply_messages(
+                data,
+                history.messages,
+                total=data.messages_total,
+                unread=False,
+                unread_count=unread_count(history.messages),
+                polled_at=data.messages_polled_at,
+                backfilled_at=history.backfilled_at,
+            )
+        )
+        return True
+
+    async def _apply_shared_messages(self, data: CheryData) -> CheryData:
+        """Copy the account inbox onto this vehicle without polling it again.
+
+        The message centre is per account, not per VIN. Only the coordinator
+        that owns the account session talks to it; the other vehicles on the
+        same login show that one history.
+        """
+        history = self._message_history or self._create_message_history()
+        await history.async_load()
+        if history.is_empty and not history.backfilled_at:
+            return data
+        return apply_messages(
+            data,
+            history.messages,
+            total=len(history.messages),
+            unread_count=unread_count(history.messages),
+            backfilled_at=history.backfilled_at,
+        )
+
+    def _create_message_history(self) -> MessageHistory:
+        """Return the one on-disk inbox history for this config entry.
+
+        Several vehicles share the entry. A history object per coordinator,
+        all writing the same store key, kept overwriting each other.
+        """
+        entry_id = str(getattr(self.entry, "entry_id", "") or "default")
+        root = self.hass.data.setdefault(DOMAIN, {})
+        if not isinstance(root, dict):
+            root = {}
+            self.hass.data[DOMAIN] = root
+        histories = root.setdefault("message_histories", {})
+        history = histories.get(entry_id)
+        if history is None:
+            history = MessageHistory(self.hass, entry_id)
+            histories[entry_id] = history
+        self._message_history = history
+        return history
+
+    def _may_rescan(self, now: datetime) -> bool:
+        """Return whether a full inbox rescan is allowed by the throttle."""
+        last = self._messages_rescanned_at
+        return last is None or now - last >= MESSAGES_RESCAN_INTERVAL
 
     async def _merge_theft_alarm(self, data: CheryData) -> CheryData:
         """Read the theft-alarm switch. A failed query keeps the last state."""
@@ -412,16 +778,14 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
             response = await self.api.send_command(vin, "ve_1209", pin)
             if not response.get("ok"):
                 message = response.get("message") or response.get("code")
-                raise CheryEuropeCommandError(
-                    f"Chery Europe command failed: {message}"
-                )
+                raise CheryEuropeCommandError(f"Chery Europe command failed: {message}")
             self._update_status(wake_status="Wake request sent ✅")
             self.schedule_location_refresh()
             self.schedule_refresh_after_command()
         except CheryEuropeException as exc:
             self._update_status(wake_status=f"Wake failed ❌: {exc}")
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._update_status(wake_status=f"Wake failed ❌: {exc}")
             raise HomeAssistantError("Failed to wake Chery Europe vehicle") from exc
 
@@ -441,17 +805,13 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
             response = await self.api.send_command(vin, "ve_1209", pin)
             if not response.get("ok"):
                 message = response.get("message") or response.get("code")
-                raise CheryEuropeCommandError(
-                    f"Chery Europe command failed: {message}"
-                )
+                raise CheryEuropeCommandError(f"Chery Europe command failed: {message}")
             self.schedule_location_refresh()
-            self._update_status(
-                probe_status="Locate sent — waiting for GPS fix… ⏳"
-            )
+            self._update_status(probe_status="Locate sent — waiting for GPS fix… ⏳")
         except CheryEuropeException as exc:
             self._update_status(probe_status=f"Position read failed ❌: {exc}")
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._update_status(probe_status=f"Position read failed ❌: {exc}")
             raise HomeAssistantError("Failed to read Chery Europe position") from exc
 
@@ -480,9 +840,7 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
             )
             if not response.get("ok"):
                 message = response.get("message") or response.get("code")
-                raise CheryEuropeCommandError(
-                    f"Chery Europe command failed: {message}"
-                )
+                raise CheryEuropeCommandError(f"Chery Europe command failed: {message}")
 
             got = False
             for _ in range(6):
@@ -506,7 +864,7 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         except CheryEuropeException as exc:
             self._update_status(probe_status=f"Full refresh failed ❌: {exc}")
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._update_status(probe_status=f"Full refresh failed ❌: {exc}")
             raise HomeAssistantError("Failed to refresh Chery Europe status") from exc
 
@@ -567,16 +925,60 @@ class CheryEuropeDataUpdateCoordinator(DataUpdateCoordinator[CheryData]):
         if client.start():
             self._mqtt = client
 
-    def _handle_mqtt_payload(self, service: str, payload: dict) -> None:
-        self.hass.loop.call_soon_threadsafe(self._apply_mqtt_payload, service, payload)
+    def _handle_mqtt_payload(
+        self, service: str, payload: dict, envelope: dict | None = None
+    ) -> None:
+        self.hass.loop.call_soon_threadsafe(
+            self._apply_mqtt_payload, service, payload, envelope
+        )
 
-    def _apply_mqtt_payload(self, service: str, payload: dict, *, routed: bool = False) -> None:
+    def _record_mqtt_frame(
+        self, service: str, payload: dict, envelope: dict | None
+    ) -> None:
+        """Keep the last frame received on the message-centre topic.
+
+        Everything the car pushes ends up here, including frames this
+        integration does not act on, so the reply sensor shows the last
+        answer even when it only carries a notification.
+        """
         if self.data is None:
+            return
+        raw = payload or envelope or {}
+        try:
+            text = json.dumps(raw, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(raw)
+        if len(text) > MQTT_REPLY_MAX_CHARS:
+            text = text[:MQTT_REPLY_MAX_CHARS] + "…"
+        updated = replace(
+            self.data,
+            mqtt_last_service=service or None,
+            mqtt_last_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            mqtt_last_payload=text,
+            mqtt_frames_seen=(self.data.mqtt_frames_seen or 0) + 1,
+        )
+        self.async_set_updated_data(self._publish_data(updated))
+
+    def _apply_mqtt_payload(
+        self,
+        service: str,
+        payload: dict,
+        envelope: dict | None = None,
+        *,
+        routed: bool = False,
+    ) -> None:
+        if self.data is None:
+            return
+        if not routed:
+            self._record_mqtt_frame(service, payload, envelope)
+        if not payload:
             return
         incoming = _payload_vin(payload)
         if not routed and incoming and self._mqtt_siblings:
             for sibling in self._mqtt_siblings:
-                target = sibling.vin_filter or (sibling.data.vin if sibling.data else None)
+                target = sibling.vin_filter or (
+                    sibling.data.vin if sibling.data else None
+                )
                 if target == incoming:
                     sibling._apply_mqtt_payload(service, payload, routed=True)
                     return
@@ -659,12 +1061,15 @@ class CheryEuropeRuntime:
     def last_update_success(self) -> bool | None:
         if not self.coordinators:
             return None
-        return all(getattr(item, "last_update_success", False) for item in self.coordinators)
+        return all(
+            getattr(item, "last_update_success", False) for item in self.coordinators
+        )
 
     @property
     def last_update_success_time(self):
         times = [
-            getattr(item, "last_update_success_time", None) for item in self.coordinators
+            getattr(item, "last_update_success_time", None)
+            for item in self.coordinators
         ]
         present = [item for item in times if item is not None]
         return max(present) if present else None

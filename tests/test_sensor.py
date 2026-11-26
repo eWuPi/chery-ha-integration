@@ -13,6 +13,7 @@ from homeassistant.const import (
     UnitOfElectricPotential,
     UnitOfPower,
     UnitOfPressure,
+    UnitOfTemperature,
 )
 
 from custom_components.chery_europe.const import DOMAIN
@@ -150,6 +151,8 @@ def test_numeric_sensors_have_long_term_statistics_state_class():
         "tire_temperature_front_right": SensorStateClass.MEASUREMENT,
         "tire_temperature_rear_left": SensorStateClass.MEASUREMENT,
         "tire_temperature_rear_right": SensorStateClass.MEASUREMENT,
+        "exterior_temperature": SensorStateClass.MEASUREMENT,
+        "interior_temperature": SensorStateClass.MEASUREMENT,
     }
     by_key = {desc.key: desc.state_class for desc in SENSOR_DESCRIPTIONS}
 
@@ -192,3 +195,39 @@ def test_sensor_device_info_uses_vehicle_vin_and_chery_metadata():
     assert device_info["serial_number"] == "VIN123"
     assert sensor.unique_id == "fallback-entry_battery_level"
     assert "VIN123" not in sensor.unique_id
+
+
+def test_exterior_temperature_reads_the_status_payload():
+    """outsideTemperature from the status document drives the outside sensor."""
+    description = next(
+        desc for desc in SENSOR_DESCRIPTIONS if desc.key == "exterior_temperature"
+    )
+    sensor = _sensor(
+        "exterior_temperature", CheryData(vin="VIN123", exterior_temperature=7.5)
+    )
+
+    assert sensor.native_value == 7.5
+    assert sensor.device_class == SensorDeviceClass.TEMPERATURE
+    assert sensor.native_unit_of_measurement == UnitOfTemperature.CELSIUS
+    assert description.state_class == SensorStateClass.MEASUREMENT
+    assert _sensor("exterior_temperature", CheryData(vin="VIN123")).native_value is None
+
+
+def test_interior_temperature_reads_the_cabin_temperature():
+    """The cabin field is exposed on its own, next to the climate entity."""
+    sensor = _sensor(
+        "interior_temperature", CheryData(vin="VIN123", interior_temperature=21.5)
+    )
+
+    assert sensor.native_value == 21.5
+    assert sensor.device_class == SensorDeviceClass.TEMPERATURE
+    assert sensor.native_unit_of_measurement == UnitOfTemperature.CELSIUS
+    assert _sensor("interior_temperature", CheryData(vin="VIN123")).native_value is None
+
+
+def test_interior_temperature_is_disabled_after_install():
+    """Off by default: the climate card already shows the cabin temperature."""
+    sensor = _sensor("interior_temperature", CheryData(vin="VIN123"))
+
+    assert sensor.entity_registry_enabled_default is False
+    assert sensor.entity_category is None

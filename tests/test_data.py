@@ -2,12 +2,16 @@
 
 """Tests for CheryData.from_api_response normalization of HVAC/lock feedback fields."""
 
-from datetime import datetime, timezone
+import inspect
+from datetime import UTC, datetime
 
 import pytest
 
 pytest.importorskip("homeassistant")
 
+from homeassistant.helpers.device_registry import DeviceRegistry
+
+from custom_components.chery_europe.const import DOMAIN
 from custom_components.chery_europe.data import (
     CheryData,
     apply_charge_appointment,
@@ -21,7 +25,6 @@ from custom_components.chery_europe.data import (
     vehicle_display_name,
 )
 from custom_components.chery_europe.types.vehicle_models import VehicleStatus
-
 
 # ---------------------------------------------------------------------------
 # Dict input — camelCase key variants
@@ -47,6 +50,16 @@ def test_dict_camelcase_keys_normalize_correctly():
     assert data.hvac_enabled is True
     assert data.hvac_mode == "auto"
     assert data.target_temperature == 22.5
+
+
+def test_interior_temperature_parses_from_camelcase_keys():
+    """The cabin temperature arrives as interiorTemperature/interior_temperature."""
+    for key in ("interior_temperature", "interiorTemperature", "insideTemperature"):
+        data = CheryData.from_api_response({"vin": "VIN123", key: "21.5"})
+
+        assert data.interior_temperature == 21.5
+
+    assert CheryData.from_api_response({"vin": "VIN123"}).interior_temperature is None
 
 
 def test_dict_snake_case_keys_normalize_correctly():
@@ -437,9 +450,9 @@ def test_freshness_advances_when_telemetry_changes_and_never_backwards():
         battery_level=79,
         last_updated="2026-11-16T18:15:00+00:00",
     )
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     updated = apply_data_freshness(previous, changed)
-    after = datetime.now(timezone.utc)
+    after = datetime.now(UTC)
 
     stamped = datetime.fromisoformat(updated.last_updated)
     assert before <= stamped <= after
@@ -630,7 +643,143 @@ def test_vehicle_display_name_never_returns_the_vin():
     assert "TESTVIN0000000001" not in vehicle_display_name(data)
 
 
-def test_registry_names_lose_the_vin_but_keep_it_as_the_serial_number():
+def test_scoped_device_lookup_matches_ha_signature():
+    """The scoped registry call must match what HA declares, not what we assume.
+
+    ``async_get_device_by_identifier`` takes the full ``(domain, identifier)``
+    tuple plus the entry id; a mock registry happily accepts any shape, so bind
+    the real signature here instead. Cores that predate the method only expose
+    the unscoped lookup, which the helper keeps as a fallback.
+    """
+    lookup = getattr(DeviceRegistry, "async_get_device_by_identifier", None)
+    if lookup is None:
+        inspect.signature(DeviceRegistry.async_get_device).bind(
+            None, identifiers={(DOMAIN, "vin")}
+        )
+        return
+    sig = inspect.signature(lookup)
+    sig.bind(None, (DOMAIN, "vin"), "entry-1")
+
+
+def test_device_lookup_falls_back_when_the_scoped_method_is_missing():
+    """Older cores resolve the device through the unscoped identifier set."""
+    from custom_components.chery_europe.entity import async_device_by_identifier
+
+    class _Registry:
+        def async_get_device(self, identifiers):
+            self.identifiers = identifiers
+            return "device"
+
+    registry = _Registry()
+
+    assert async_device_by_identifier(registry, "vin", "entry-1") == "device"
+    assert registry.identifiers == {(DOMAIN, "vin")}
+
+
+def test_entity_id_renames_match_the_polish_names() -> None:
+    """Every rename target must be what the Polish name actually slugifies to."""
+    import json
+    from pathlib import Path
+
+    from homeassistant.util import slugify
+
+    from custom_components.chery_europe.entity import ENTITY_ID_RENAMES, UID_TRANSLATION_KEYS
+
+    path = Path(__file__).parent.parent / "custom_components/chery_europe/translations/pl.json"
+    translations = json.loads(path.read_text(encoding="utf-8"))["entity"]
+    for domain, key, _old_slug, new_slug in ENTITY_ID_RENAMES:
+        translation_key = UID_TRANSLATION_KEYS.get(key, key)
+        entry = translations.get(domain, {}).get(translation_key)
+        assert entry is not None and "name" in entry, (
+            f"{domain}.{translation_key} has no Polish name"
+        )
+        assert entry["name"] != "", f"{domain}.{translation_key} has an empty Polish name"
+        assert slugify(entry["name"]) == new_slug, (
+            domain,
+            translation_key,
+            entry["name"],
+            new_slug,
+        )
+
+
+def test_tire_entity_ids_group_by_wheel() -> None:
+    """Pressure and temperature of one wheel must end up next to each other."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    from custom_components.chery_europe.entity import async_rename_entity_ids
+
+    entity = SimpleNamespace(
+        entity_id="sensor.wspolne_tiggo_cisnienie_przedniej_lewej_opony",
+        unique_id="wspolne_tiggo_tire_pressure_front_left",
+        domain="sensor",
+    )
+    registry = Mock()
+    registry.async_get.return_value = None
+    hass = Mock()
+    entry = SimpleNamespace(entry_id="entry-1")
+
+    with (
+        patch("custom_components.chery_europe.entity.er.async_get", return_value=registry),
+        patch(
+            "custom_components.chery_europe.entity.er.async_entries_for_config_entry",
+            return_value=[entity],
+        ),
+    ):
+        async_rename_entity_ids(hass, entry)
+
+    registry.async_update_entity.assert_called_once_with(
+        "sensor.wspolne_tiggo_cisnienie_przedniej_lewej_opony",
+        new_entity_id="sensor.wspolne_tiggo_kolo_przednie_lewe_cisnienie",
+    )
+
+
+def test_alarm_content_entity_id_follows_the_new_translation() -> None:
+    """A renamed translation must move the stale entity id, not leave it behind."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call, patch
+
+    from custom_components.chery_europe.entity import async_rename_entity_ids
+
+    entities = [
+        SimpleNamespace(
+            entity_id="sensor.wspolne_tiggo_tresc_alarmow",
+            unique_id="wspolne_tiggo_alerts_content",
+            domain="sensor",
+        ),
+        SimpleNamespace(
+            entity_id="sensor.wspolne_tiggo_nieprzeczytane_wiadomosci",
+            unique_id="wspolne_tiggo_messages_unread",
+            domain="sensor",
+        ),
+    ]
+    registry = Mock()
+    registry.async_get.return_value = None
+    hass = Mock()
+    entry = SimpleNamespace(entry_id="entry-1")
+
+    with (
+        patch("custom_components.chery_europe.entity.er.async_get", return_value=registry),
+        patch(
+            "custom_components.chery_europe.entity.er.async_entries_for_config_entry",
+            return_value=entities,
+        ),
+    ):
+        async_rename_entity_ids(hass, entry)
+
+    assert registry.async_update_entity.call_args_list == [
+        call(
+            "sensor.wspolne_tiggo_tresc_alarmow",
+            new_entity_id="sensor.wspolne_tiggo_alarmy_tresc",
+        ),
+        call(
+            "sensor.wspolne_tiggo_nieprzeczytane_wiadomosci",
+            new_entity_id="sensor.wspolne_tiggo_wiadomosci_nieprzeczytane",
+        ),
+    ]
+
+
+def test_registry_names_lose_the_vin():
     from types import SimpleNamespace
     from unittest.mock import Mock, patch
 
@@ -648,14 +797,15 @@ def test_registry_names_lose_the_vin_but_keep_it_as_the_serial_number():
         id="dev1",
         identifiers={(DOMAIN, vin)},
         name=vin,
-        # Older builds blanked the serial number when they dropped the VIN
-        # from the names; the migration puts it back.
+        # Older builds blanked the serial number; the migration restores the VIN.
         serial_number=None,
     )
     entity_reg = Mock()
     entity_reg.async_generate_entity_id.return_value = "sensor.battery_level"
     device_reg = Mock()
     device_reg.async_get_device.return_value = device
+    # The scoped lookup is the current API; the deprecated one is only a fallback.
+    device_reg.async_get_device_by_identifier.return_value = device
     hass = Mock()
     entry = SimpleNamespace(
         entry_id="entry-1",
@@ -681,6 +831,10 @@ def test_registry_names_lose_the_vin_but_keep_it_as_the_serial_number():
     ):
         async_drop_vin_from_names(hass, entry, vin)
 
+    device_reg.async_get_device_by_identifier.assert_called_once_with(
+        (DOMAIN, vin), "entry-1"
+    )
+    device_reg.async_get_device.assert_not_called()
     device_update = device_reg.async_update_device.call_args.kwargs
     assert (DOMAIN, "entry-1") in device_update["new_identifiers"]
     assert (DOMAIN, vin) not in device_update["new_identifiers"]
@@ -999,3 +1153,86 @@ def test_vehicle_choices_hide_the_full_vin_and_split_duplicate_labels():
     assert "LVVDB21B0PD111111" not in choices[0][1]
     assert choices[0][1].endswith("(1111)")
     assert choices[1][1].endswith("(2222)")
+
+
+def test_parse_charge_appointment_unwraps_the_tspconsole_body():
+    """chargeAppointQuery answers {"code", "body"}, not {"data"}."""
+    enabled, plan = parse_charge_appointment(
+        {
+            "code": "000000",
+            "sign": "1TGBQ9PVC5JUTI5Z6MCEM0PLYBQ2DN/QQQ7+PSJELMI=",
+            "body": {
+                "mainSwitch": 0,
+                "vin": "LVVDB21B0PD000042",
+                "id": 50056,
+                "chargeAppointPlans": [
+                    {
+                        "timeConsuming": 780,
+                        "chargeAppointMainId": 50056,
+                        "cycleData": [1, 2, 3, 4, 5, 6, 7],
+                        "startTime": 375,
+                        "id": 421517421,
+                        "switchStatus": 0,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert enabled is False
+    assert plan is not None
+    assert plan["startTime"] == 375
+    assert plan["timeConsuming"] == 780
+    from custom_components.chery_europe.charge_schedule import plan_duration_hours
+
+    assert plan_duration_hours(plan) == 13
+
+
+def test_charge_and_departure_entities_move_out_of_the_config_section() -> None:
+    """The stored category wins over the description, so old installs need migrating."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call, patch
+
+    from homeassistant.const import EntityCategory
+
+    from custom_components.chery_europe.entity import async_move_to_controls
+
+    entities = [
+        SimpleNamespace(
+            entity_id="time.wspolne_tiggo_ladowanie_godzina_startu",
+            unique_id="wspolne_tiggo_charge_start_time",
+            entity_category=EntityCategory.CONFIG,
+        ),
+        SimpleNamespace(
+            entity_id="switch.wspolne_tiggo_wyjazd_plan",
+            unique_id="wspolne_tiggo_departure",
+            entity_category=EntityCategory.CONFIG,
+        ),
+        SimpleNamespace(
+            entity_id="switch.wspolne_tiggo_automatyczne_aktualizacje",
+            unique_id="wspolne_tiggo_automatic_updates",
+            entity_category=EntityCategory.CONFIG,
+        ),
+        SimpleNamespace(
+            entity_id="sensor.wspolne_tiggo_ladowanie_stan",
+            unique_id="wspolne_tiggo_charge_status",
+            entity_category=None,
+        ),
+    ]
+    registry = Mock()
+    hass = Mock()
+    entry = SimpleNamespace(entry_id="entry-1")
+
+    with (
+        patch("custom_components.chery_europe.entity.er.async_get", return_value=registry),
+        patch(
+            "custom_components.chery_europe.entity.er.async_entries_for_config_entry",
+            return_value=entities,
+        ),
+    ):
+        async_move_to_controls(hass, entry)
+
+    assert registry.async_update_entity.call_args_list == [
+        call("time.wspolne_tiggo_ladowanie_godzina_startu", entity_category=None),
+        call("switch.wspolne_tiggo_wyjazd_plan", entity_category=None),
+    ]

@@ -6,7 +6,7 @@ from datetime import timedelta
 NAME = "Chery Europe"
 DOMAIN = "chery_europe"
 DOMAIN_DATA = f"{DOMAIN}_data"
-VERSION = "0.6.1"
+VERSION = "0.7.0b7"
 ISSUE_URL = "https://github.com/Przemko92/chery-ha-integration/issues"
 
 # Platforms
@@ -38,12 +38,33 @@ PLATFORMS = [
 # Services
 SERVICE_SEND_COMMAND = "send_command"
 SERVICE_SET_SCHEDULED_CHARGING = "set_scheduled_charging"
+SERVICE_SET_PREPARE_PLAN = "set_prepare_plan"
+SERVICE_CANCEL_PREPARE_PLAN = "cancel_prepare_plan"
+SERVICE_LIST_PREPARE_PLANS = "list_prepare_plans"
+SERVICE_GET_MESSAGES = "get_messages"
+ATTR_PAGE = "page"
+ATTR_PAGE_SIZE = "page_size"
+ATTR_UNREAD_ONLY = "unread_only"
 ATTR_VIN = "vin"
 ATTR_COMMAND_ID = "command_id"
 ATTR_PIN = "pin"
 ATTR_START_TIME = "start_time"
 ATTR_DURATION_HOURS = "duration_hours"
+#: airControl "times" — climate runtime in minutes (5, 10 or 15).
+ATTR_AIR_DURATION = "duration"
 ATTR_ENABLED = "enabled"
+ATTR_PLAN_ID = "plan_id"
+ATTR_PLAN_NAME = "plan_name"
+ATTR_TRAVEL_TIME = "travel_time"
+ATTR_REPEAT = "repeat"
+ATTR_DAYS = "days"
+ATTR_TEMPERATURE = "temperature"
+ATTR_BATTERY_HEAT = "battery_heat"
+ATTR_STEERING_WHEEL_HEAT = "steering_wheel_heat"
+ATTR_DRIVER_SEAT_HEAT = "driver_seat_heat"
+ATTR_FRONT_DEFROST = "front_defrost"
+ATTR_REAR_DEFROST = "rear_defrost"
+ATTR_DRY_RUN = "dry_run"
 
 # Configuration and options
 CONF_LOGIN = "login"
@@ -82,6 +103,16 @@ REFRESH_HV_WAIT_SECONDS = 25
 POST_COMMAND_REFRESH_DELAYS = (5, 10, 20)
 # Same vehicle command (lock, climate, ...) is not sent more often than this.
 COMMAND_MIN_INTERVAL_SECONDS = 5
+# The car executes ONE command at a time: a command that arrives while the
+# previous one is still running comes back as A00082 and is not executed, so
+# the same command is retried after these pauses before the entity fails.
+COMMAND_BUSY_CODE = "A00082"
+COMMAND_BUSY_RETRY_DELAYS = (6, 10)
+# Wake/locate only makes the car answer: it is not a control write, so it must
+# not clear the last refusal shown by the diagnostics entities.
+NON_CONTROL_COMMAND_IDS = frozenset({"ve_1209"})
+# What the diagnostics error entities read when the last command went through.
+NO_COMMAND_ERROR = "brak"
 STATUS_MAX_LEN = 255
 
 # Login identity prefix used by the legend BFF email/SMS OTP grant.
@@ -127,6 +158,64 @@ DEFAULT_TSP_HOST = "https://tspconsole-eu.cheryinternational.com"
 API_REALTIME_PATH = "/asr/manager/realtime"
 API_QUERY_LOCATION_PATH = "/asc/vehicleControl/queryVehicleLocation"
 API_CHARGE_APPOINT_QUERY_PATH = "/asd/chargeAppointManage/chargeAppointQuery"
+# Scheduled cabin/battery preparation (the app's "travel appointment").
+# The departure plan the app shows is read from /asd/travelManage/travelQuery.
+# Verified live on 2026-11-24: it answers 200 with
+# {"code":"000000","body":{"appointmentTravelSetVOS":[{"travelTime":475,
+# "travelDate":[1..7],"switcher":1,"id":452903971}],"mainSwitcher":"1",...}}
+# while /asd/prepareManage/prepareQuery answers {"preparePlans": []} on the same
+# car, so prepareQuery is a different feature and only a fallback here.
+# The write handler is /asc/vehicleControl/appointmentTravel - a POST sweep of
+# the neighbouring names (travelAppointControl, setTravelAppointControl,
+# prepareControl, prepareControlSetSingle, ...) all came back 404 while
+# appointmentTravel answered 200 like chargeAppointControl does.
+API_TRAVEL_APPOINT_QUERY_PATH = "/asd/travelManage/travelQuery"
+API_TRAVEL_APPOINT_QUERY_FALLBACKS = (
+    "/asd/travelManage/travelQuery",
+    "/asd/prepareManage/prepareQuery",
+)
+TRAVEL_APPOINT_ENDPOINT = "appointmentTravel"
+API_TRAVEL_APPOINT_CONTROL_PATHS: tuple[str, ...] = (
+    "/asc/vehicleControl/appointmentTravel",
+    "/asd/prepareManage/appointmentTravel",
+)
+# Preparation plans are read at most this often, whatever the poll interval,
+# so a 1-minute HV poll does not multiply the API calls.
+PREPARE_POLL_INTERVAL = timedelta(minutes=60)
+# Vehicle message inbox (message centre).  The path carries the service name
+# (``message``) instead of ``tsp``; the app reads it with a POST body of
+# ``{"pageNo": n, "pageSize": n}``.
+API_MESSAGES_PAGING_PATH = "/api/message/v1/message/inbox/inboxs/C/pagingToC"
+API_MESSAGES_UNREAD_PATH = "/api/message/v1/message/inbox/inboxs/C/getUnread"
+API_MESSAGES_UPDATE_READ_PATH = (
+    "/api/message/v1/message/inbox/inboxs/C/updateStatusToRead"
+)
+DEFAULT_MESSAGES_PAGE_SIZE = 10
+# The inbox costs one extra request pair, so it is read at most this often even
+# when the vehicle itself is polled every minute.
+MESSAGES_POLL_INTERVAL = timedelta(minutes=30)
+# The first run imports the whole inbox once; the endpoint honours large pages,
+# so 563 messages cost three requests (page size 200) instead of 57.
+MESSAGES_BACKFILL_PAGE_SIZE = 200
+MESSAGES_BACKFILL_MAX_PAGES = 50
+# Later polls only read the newest page and merge it into the stored history.
+MESSAGES_POLL_PAGE_SIZE = 50
+MESSAGES_HISTORY_LIMIT = 2000
+# Reading a message in the phone app flips its flag in the cloud, so the
+# locally counted unread number drifts; a contradicting ``getUnread`` answer
+# triggers one full rescan, at most this often.
+MESSAGES_RESCAN_INTERVAL = timedelta(hours=1)
+MESSAGES_STORE_VERSION = 1
+MESSAGES_STORE_KEY = f"{DOMAIN}.messages.{{entry_id}}"
+# Full history on disk, for reading older messages outside the entity state.
+MESSAGES_EXPORT_FILENAME = "chery_messages.json"
+# Attributes must stay well under the 16 KiB recorder limit, hence the caps.
+MESSAGES_ATTRIBUTE_ITEMS = 10
+MESSAGES_CONTENT_ITEMS = 10
+# The text sensor keeps the newest messages as one line each; the attribute payload must
+# stay well below the 16 KiB recorder limit for the whole state object.
+MESSAGES_HISTORY_ITEMS = 200
+MESSAGES_HISTORY_CHARS = 9000
 API_THEFT_QUERY_PATH = "/act/theftAlarm/querySwitch"
 API_THEFT_SET_PATH = "/act/theftAlarm/setSwitch"
 TSP_CODE_OK = "000000"

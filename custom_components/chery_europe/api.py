@@ -3,44 +3,63 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 
 import aiohttp
 
 from .auth import CheryEuropeAuth
 from .const import (
-    API_CPM_CHECK_PASSWORD_PATH,
-    API_QUERY_LOCATION_PATH,
     API_CHARGE_APPOINT_QUERY_PATH,
+    API_CPM_CHECK_PASSWORD_PATH,
+    API_MESSAGES_PAGING_PATH,
+    API_MESSAGES_UNREAD_PATH,
+    API_MESSAGES_UPDATE_READ_PATH,
+    API_QUERY_LOCATION_PATH,
     API_REALTIME_PATH,
     API_THEFT_QUERY_PATH,
+    API_TRAVEL_APPOINT_CONTROL_PATHS,
+    API_TRAVEL_APPOINT_QUERY_FALLBACKS,
     API_TSP_LOGIN_PATH,
     API_VMC_QUERY_AUTHORITY_PATH,
     API_VMC_QUERY_LIST_PATH,
     API_VMC_SET_VEC_DEFAULT_PATH,
+    COMMAND_BUSY_CODE,
+    COMMAND_BUSY_RETRY_DELAYS,
     DEFAULT_BASE_URL,
     DEFAULT_CHANNEL_ID,
+    DEFAULT_MESSAGES_PAGE_SIZE,
     DEFAULT_TSP_HOST,
     TOKEN_REFRESH_QUOTA,
+    TRAVEL_APPOINT_ENDPOINT,
     TSP_CODE_ASLEEP,
     TSP_CODE_OK,
 )
 from .crypto import encrypt_command_pin
-from .signing import SIGN_SECRET, get_identity_headers
-from .tsp_sign import auth_headers, sign_body
-from .vehicle_commands import COMMAND_SPECS, command_result
-from .permissions import UNKNOWN, adapt_command, normalize_permissions
-from .data import parse_charge_appointment, parse_theft_alarm
-from .request_queue import ApiRequestQueue, command_interval_key
+from .data import (
+    parse_charge_appointment,
+    parse_theft_alarm,
+    parse_travel_appointment,
+)
 from .exceptions import (
     CheryEuropeAuthError,
+    CheryEuropeCommandError,
     CheryEuropeConnectionError,
     CheryEuropeRateLimitError,
     CheryEuropeTimeoutError,
 )
+from .messages import parse_unread_messages
+from .permissions import UNKNOWN, adapt_command, normalize_permissions
+from .request_queue import ApiRequestQueue, command_interval_key
+from .signing import SIGN_SECRET, get_identity_headers
+from .tsp_sign import auth_headers, sign_body
 from .types.auth_models import AuthResponse
 from .types.vehicle_models import VehicleStatus
+from .vehicle_commands import (
+    COMMAND_SPECS,
+    build_travel_appoint_body,
+    command_result,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +99,11 @@ class CheryEuropeApi:
         self._tsp_login_lock = asyncio.Lock()
         # One in-flight HTTP call, and the same vehicle command at most every 5s.
         self._request_queue = ApiRequestQueue()
+        # Injected so tests can drive the pause between busy retries.
+        self._sleep = asyncio.sleep
+        # Set by the coordinator to see every vehicle command outcome; keeps the
+        # diagnostics entities honest even when a caller swallows the failure.
+        self.command_result_callbacks: list[Any] = []
 
     async def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
         """Perform an authenticated request with retry and token refresh."""
@@ -177,6 +201,101 @@ class CheryEuropeApi:
             return None
         return parse_charge_appointment(response)
 
+    async def query_travel_appointment(self, vin: str) -> list[dict[str, Any]] | None:
+        """Return the scheduled cabin/battery preparation plans.
+
+        ``None`` means the query failed or the car did not answer, so callers
+        keep the last known plan list instead of clearing it. The working path
+        is remembered, so the fallbacks are only tried once per session.
+        """
+        await self._ensure_tsp_session()
+        if not self._user_token:
+            return None
+        for path in self._travel_query_paths():
+            try:
+                response = await self._tsp_signed_post(path, {"vin": vin})
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Travel appointment query %s failed for %s: %s", path, vin, exc
+                )
+                continue
+            if not isinstance(response, dict):
+                continue
+            code = response.get("code")
+            if code == TSP_CODE_ASLEEP:
+                return None
+            if code not in (TSP_CODE_OK, 0, "0", None):
+                _LOGGER.debug(
+                    "Travel appointment query %s for %s returned code %s",
+                    path,
+                    vin,
+                    code,
+                )
+                continue
+            plans = parse_travel_appointment(response)
+            if plans is None:
+                continue
+            if getattr(self, "_travel_query_path", None) != path:
+                _LOGGER.debug("Travel appointment query path is %s", path)
+                self._travel_query_path = path
+            return plans
+        return None
+
+    def _travel_query_paths(self) -> list[str]:
+        """Return the query paths to try, cheapest first."""
+        cached = getattr(self, "_travel_query_path", None)
+        paths = [path for path in API_TRAVEL_APPOINT_QUERY_FALLBACKS]
+        if cached and cached in paths:
+            paths.remove(cached)
+            paths.insert(0, cached)
+        return paths
+
+    async def send_travel_appointment(
+        self,
+        vin: str,
+        pin: str,
+        plans: list[dict[str, Any]],
+        permissions: Any = None,
+    ) -> dict[str, Any]:
+        """Write the complete preparation plan list to the car.
+
+        The body is the whole list — the car replaces what is stored — so the
+        caller must pass every plan that should survive, disabled ones too.
+        The write path is discovered once (HTTP 404 means "not this module")
+        and then cached for the rest of the session.
+        """
+        body = build_travel_appoint_body({"plans": plans, "vin": vin})
+        perms = self._permissions if permissions is None else permissions
+        endpoint, body = adapt_command(TRAVEL_APPOINT_ENDPOINT, body, perms)
+        last_error: Exception | None = None
+        for path in self._travel_control_paths():
+            try:
+                response = await self._send_vehicle_control_retrying(
+                    vin=vin, pin=pin, endpoint=endpoint, body=body, path=path
+                )
+            except CheryEuropeConnectionError as exc:
+                if "status 404" not in str(exc):
+                    raise
+                _LOGGER.debug("Travel appointment control path %s is 404", path)
+                last_error = exc
+                continue
+            if getattr(self, "_travel_control_path", None) != path:
+                _LOGGER.debug("Travel appointment control path is %s", path)
+                self._travel_control_path = path
+            return command_result(response)
+        raise last_error or CheryEuropeCommandError(
+            "No travel appointment control endpoint answered"
+        )
+
+    def _travel_control_paths(self) -> list[str]:
+        """Return the control paths to try, the known-good one first."""
+        cached = getattr(self, "_travel_control_path", None)
+        paths = list(API_TRAVEL_APPOINT_CONTROL_PATHS)
+        if cached and cached in paths:
+            paths.remove(cached)
+            paths.insert(0, cached)
+        return paths
+
     async def query_theft_alarm(self, vin: str) -> bool | None:
         """Return the theft-alarm switch, or None when the car did not answer."""
         await self._ensure_tsp_session()
@@ -196,6 +315,73 @@ class CheryEuropeApi:
             _LOGGER.debug("Theft alarm query for %s returned code %s", vin, code)
             return None
         return parse_theft_alarm(response)
+
+    async def fetch_messages(
+        self, page: int = 1, page_size: int = DEFAULT_MESSAGES_PAGE_SIZE
+    ) -> dict[str, Any] | None:
+        """Return one page of the vehicle message inbox.
+
+        The message service lives under ``/api/message/...`` (its own routing
+        prefix, not ``tsp``) and wants the paging values in a JSON body; a GET
+        with query parameters ends in a 500 from the Spring gateway.  ``None``
+        means the request failed, so callers keep the last known list.
+        """
+        await self._ensure_tsp_session()
+        try:
+            response = await self._request(
+                "POST",
+                API_MESSAGES_PAGING_PATH,
+                json={"pageNo": page, "pageSize": page_size},
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Vehicle messages query failed: %s", exc)
+            return None
+        if not isinstance(response, dict):
+            return None
+        if response.get("code") not in (TSP_CODE_OK, 0, "0", None):
+            _LOGGER.debug(
+                "Vehicle messages query returned code %s", response.get("code")
+            )
+            return None
+        return response
+
+    async def fetch_messages_unread(self) -> bool | None:
+        """Return whether the inbox has unread messages (``None`` on failure).
+
+        The endpoint only answers GET; a POST body is rejected with a 500.
+        """
+        await self._ensure_tsp_session()
+        try:
+            response = await self._request("GET", API_MESSAGES_UNREAD_PATH)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Unread messages query failed: %s", exc)
+            return None
+        return parse_unread_messages(response)
+
+    async def mark_messages_read(self) -> bool:
+        """Mark the whole inbox as read; ``True`` when the cloud accepted it.
+
+        ``updateStatusToRead`` flips every entry in one shot -- an ``id`` in
+        the body is accepted but not needed, and the response carries
+        ``data: true`` on success.  The call is user triggered only; polling
+        must never touch it so the account stays well below the rate limits.
+        """
+        await self._ensure_tsp_session()
+        try:
+            response = await self._request(
+                "POST", API_MESSAGES_UPDATE_READ_PATH, json={}
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Marking the inbox read failed: %s", exc)
+            return False
+        if not isinstance(response, dict):
+            return False
+        if response.get("code") not in (TSP_CODE_OK, 0, "0", None):
+            _LOGGER.debug(
+                "Marking the inbox read returned code %s", response.get("code")
+            )
+            return False
+        return bool(response.get("data", True))
 
     async def _tsp_query_payload(self, path: str, vin: str) -> dict[str, Any] | None:
         """Return a tspconsole dict payload, or None when the vehicle is asleep."""
@@ -246,14 +432,63 @@ class CheryEuropeApi:
         body = spec.build_body(kwargs)
         perms = self._permissions if permissions is None else permissions
         endpoint, body = adapt_command(spec.endpoint, body, perms)
-        response = await self._send_vehicle_control(
+        response = await self._send_vehicle_control_retrying(
             vin=vin,
             pin=pin,
             endpoint=endpoint,
             body=body,
             path=spec.path,
+            command_id=command_id,
         )
         return command_result(response)
+
+    async def _send_vehicle_control_retrying(
+        self,
+        *,
+        vin: str,
+        pin: str,
+        endpoint: str,
+        body: dict[str, Any],
+        path: str | None = None,
+        command_id: str | None = None,
+    ) -> Any:
+        """Send a command, waiting out the car while it reports it is busy.
+
+        The car executes one command at a time, so a command that arrives while
+        the previous one is still running comes back as A00082 and is not
+        executed at all; the very same request a few seconds later lands.
+        """
+        attempt = 0
+        while True:
+            response = await self._send_vehicle_control(
+                vin=vin, pin=pin, endpoint=endpoint, body=body, path=path
+            )
+            busy = isinstance(response, dict) and response.get("code") == COMMAND_BUSY_CODE
+            if not busy or attempt >= len(COMMAND_BUSY_RETRY_DELAYS):
+                self._notify_command_result(vin, command_id or endpoint, response)
+                return response
+            delay = COMMAND_BUSY_RETRY_DELAYS[attempt]
+            _LOGGER.debug(
+                "Chery Europe: the car is busy (A00082) with %s; retrying in %ss",
+                command_id or endpoint,
+                delay,
+            )
+            await self._sleep(delay)
+            attempt += 1
+
+    def _notify_command_result(self, vin: str, command_id: str, response: Any) -> None:
+        """Hand the outcome to the coordinators for their diagnostics entities."""
+        callbacks = self.command_result_callbacks
+        if not callbacks:
+            return
+        result = command_result(response)
+        for callback in list(callbacks):
+            try:
+                callback(vin, command_id, result)
+            except Exception:  # noqa: BLE001 - reporting must never break a command
+                _LOGGER.debug(
+                    "Chery Europe: command result callback failed", exc_info=True
+                )
 
     async def get_vehicle_authority(self, vin: str) -> dict[int, int]:
         """Return the vehicle command permission map, or UNKNOWN on failure."""
@@ -445,7 +680,7 @@ class CheryEuropeApi:
                 _post,
                 command_key=command_interval_key(path, params),
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise CheryEuropeTimeoutError("Chery Europe TSP request timed out") from exc
         except aiohttp.ClientConnectionError as exc:
             raise CheryEuropeConnectionError(
@@ -571,7 +806,7 @@ class CheryEuropeApi:
 
         try:
             return await self._request_queue.execute(_send)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise CheryEuropeTimeoutError("Chery Europe API request timed out") from exc
         except aiohttp.ClientConnectionError as exc:
             raise CheryEuropeConnectionError(

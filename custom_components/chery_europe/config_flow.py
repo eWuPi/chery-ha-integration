@@ -6,7 +6,13 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -258,6 +264,21 @@ class CheryEuropeConfigFlow(ConfigFlow, domain=DOMAIN):
                 token_data = token_data_from_response(response, self._client_secret)
                 unique_id = self._unique_id()
                 account_data = self._account_data()
+                if self.source == SOURCE_RECONFIGURE:
+                    entry = self._get_reconfigure_entry()
+                    new_data = {
+                        **(self._reauth_entry_data or dict(entry.data)),
+                        **account_data,
+                        **token_data,
+                    }
+                    if self._login_method != LOGIN_METHOD_SMS:
+                        new_data.pop(CONF_PHONE, None)
+                        new_data.pop(CONF_AREA_CODE, None)
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data=new_data,
+                        unique_id=unique_id,
+                    )
                 if self.source == SOURCE_REAUTH:
                     new_data = {
                         **(self._reauth_entry_data or {}),
@@ -389,6 +410,35 @@ class CheryEuropeConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_VINS: vins,
             },
             options=self._pin_options,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Sign in again with a different account email or phone number.
+
+        Home Assistant shows this as the "Reconfigure" button on the entry;
+        entities, devices and options are kept because the entry is only
+        updated, never re-created.
+        """
+        entry = self._get_reconfigure_entry()
+        data = dict(entry.data)
+        self._reauth_entry_data = data
+        self._base_url = data.get(CONF_BASE_URL, DEFAULT_BASE_URL)
+        self._client_id = data.get(CONF_CLIENT_ID)
+        self._client_secret = data.get(CONF_CLIENT_SECRET)
+        self._login_method = data.get(CONF_LOGIN_METHOD) or (
+            LOGIN_METHOD_SMS if data.get(CONF_PHONE) else LOGIN_METHOD_EMAIL
+        )
+        self._email = (
+            data.get(CONF_LOGIN) if self._login_method == LOGIN_METHOD_EMAIL else None
+        )
+        self._phone = data.get(CONF_PHONE)
+        self._area_code = data.get(CONF_AREA_CODE)
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["login_email", "login_phone"],
+            description_placeholders={"destination": self._destination_label()},
         )
 
     async def async_step_reauth(

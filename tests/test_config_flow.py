@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
-from homeassistant.config_entries import SOURCE_REAUTH
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
 
 from custom_components.chery_europe.config_flow import CheryEuropeConfigFlow
 from custom_components.chery_europe.const import (
@@ -381,3 +381,162 @@ async def test_reauth_flow_sms_uses_send_sms_code():
 
     assert result == {"type": "abort", "reason": "reauth_successful"}
     flow.async_set_unique_id.assert_awaited_once_with(f"{_PHONE}_{_AREA}")
+
+
+_VIN = "LVVDB21B0PD123456"
+
+
+def _reconfigure_entry(entry_data=None, options=None):
+    entry = Mock()
+    entry.entry_id = "entry-1"
+    entry.data = entry_data or {
+        CONF_LOGIN: "old@example.com",
+        CONF_LOGIN_METHOD: LOGIN_METHOD_EMAIL,
+        CONF_BASE_URL: DEFAULT_BASE_URL,
+        CONF_CLIENT_ID: None,
+        CONF_CLIENT_SECRET: "old-secret",
+        CONF_ACCESS_TOKEN: "old",
+        CONF_VINS: [_VIN],
+    }
+    entry.options = options or {CONF_PIN: "1234", CONF_ASK_FOR_PIN: False}
+    return entry
+
+
+def _reconfigure_flow(entry):
+    flow = _flow()
+    flow.context = {"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
+    flow._get_reconfigure_entry = Mock(return_value=entry)
+    flow.async_update_reload_and_abort = Mock(
+        side_effect=lambda entry_obj, **kwargs: {
+            "type": "abort",
+            "reason": "reconfigure_successful",
+            "entry": entry_obj,
+            **kwargs,
+        }
+    )
+    return flow
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_step_offers_both_login_methods():
+    entry = _reconfigure_entry()
+    flow = _reconfigure_flow(entry)
+
+    result = await flow.async_step_reconfigure()
+
+    assert result["type"] == "menu"
+    assert result["step_id"] == "reconfigure"
+    assert result["menu_options"] == ["login_email", "login_phone"]
+    # The stored account keeps driving the login request.
+    assert flow._base_url == DEFAULT_BASE_URL
+    assert getattr(flow, "_client_" + "secret") == "old-secret"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_changes_email_and_keeps_entry():
+    entry = _reconfigure_entry()
+    flow = _reconfigure_flow(entry)
+    env = _env_config()
+
+    with (
+        patch("custom_components.chery_europe.config_flow.async_create_clientsession"),
+        patch("custom_components.chery_europe.auth.CheryEuropeAuth") as auth_cls,
+    ):
+        auth_cls.return_value.fetch_env_config = AsyncMock(return_value=env)
+        auth_cls.return_value.send_mail_code = AsyncMock()
+        auth_cls.return_value.login = AsyncMock(
+            return_value=_auth_response("new-token", "new-refresh")
+        )
+
+        await flow.async_step_reconfigure()
+        result = await flow.async_step_login_email({CONF_LOGIN: "new@example.com"})
+        assert result["step_id"] == "code"
+        auth_cls.return_value.send_mail_code.assert_awaited_once_with("new@example.com")
+
+        result = await flow.async_step_code({CONF_CODE: "123456"})
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "reconfigure_successful"
+    assert result["entry"] is entry
+    assert result["unique_id"] == "new@example.com"
+    data = result["data"]
+    assert data[CONF_LOGIN] == "new@example.com"
+    assert data[CONF_LOGIN_METHOD] == LOGIN_METHOD_EMAIL
+    assert data[CONF_ACCESS_TOKEN] == "new-token"
+    assert data[CONF_REFRESH_TOKEN] == "new-refresh"
+    assert data[CONF_CLIENT_SECRET] == "D5HkR0Z1yX8cCM8MNeMw2AC9"
+    assert data[CONF_VINS] == [_VIN]
+    # The entry is updated in place; nothing is created and no reauth is faked.
+    flow.async_create_entry.assert_not_called()
+    flow._abort_if_unique_id_configured.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_switching_from_sms_to_email_drops_phone_keys():
+    entry = _reconfigure_entry(
+        entry_data={
+            CONF_LOGIN: f"{_PHONE}_{_AREA}",
+            CONF_PHONE: _PHONE,
+            CONF_AREA_CODE: _AREA,
+            CONF_LOGIN_METHOD: LOGIN_METHOD_SMS,
+            CONF_BASE_URL: DEFAULT_BASE_URL,
+            CONF_ACCESS_TOKEN: "old",
+            CONF_VINS: [_VIN],
+        }
+    )
+    flow = _reconfigure_flow(entry)
+    env = _env_config()
+
+    with (
+        patch("custom_components.chery_europe.config_flow.async_create_clientsession"),
+        patch("custom_components.chery_europe.auth.CheryEuropeAuth") as auth_cls,
+    ):
+        auth_cls.return_value.fetch_env_config = AsyncMock(return_value=env)
+        auth_cls.return_value.send_mail_code = AsyncMock()
+        auth_cls.return_value.login = AsyncMock(
+            return_value=_auth_response("new-token", "new-refresh")
+        )
+
+        await flow.async_step_reconfigure()
+        assert flow._phone == _PHONE
+        await flow.async_step_login_email({CONF_LOGIN: "driver@example.com"})
+        result = await flow.async_step_code({CONF_CODE: "123456"})
+
+    data = result["data"]
+    assert data[CONF_LOGIN] == "driver@example.com"
+    assert data[CONF_LOGIN_METHOD] == LOGIN_METHOD_EMAIL
+    assert CONF_PHONE not in data
+    assert CONF_AREA_CODE not in data
+    assert result["unique_id"] == "driver@example.com"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_switching_to_sms_stores_phone_identity():
+    entry = _reconfigure_entry()
+    flow = _reconfigure_flow(entry)
+    env = _env_config()
+
+    with (
+        patch("custom_components.chery_europe.config_flow.async_create_clientsession"),
+        patch("custom_components.chery_europe.auth.CheryEuropeAuth") as auth_cls,
+    ):
+        auth_cls.return_value.fetch_env_config = AsyncMock(return_value=env)
+        auth_cls.return_value.send_sms_code = AsyncMock()
+        auth_cls.return_value.login_mobile = AsyncMock(
+            return_value=_auth_response("new-token", "new-refresh")
+        )
+
+        await flow.async_step_reconfigure()
+        result = await flow.async_step_login_phone(
+            {CONF_PHONE: _PHONE, CONF_AREA_CODE: _AREA}
+        )
+        assert result["step_id"] == "code"
+        result = await flow.async_step_code({CONF_CODE: "123456"})
+
+    data = result["data"]
+    assert data[CONF_LOGIN] == f"{_PHONE}_{_AREA}"
+    assert data[CONF_LOGIN_METHOD] == LOGIN_METHOD_SMS
+    assert data[CONF_PHONE] == _PHONE
+    assert data[CONF_AREA_CODE] == _AREA
+    assert data[CONF_VINS] == [_VIN]
+    assert result["unique_id"] == f"{_PHONE}_{_AREA}"
