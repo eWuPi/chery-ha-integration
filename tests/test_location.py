@@ -17,7 +17,8 @@ from custom_components.chery_europe.data import (
 )
 from custom_components.chery_europe.mqtt import parse_vehicle_mqtt_message
 
-VIN = "TESTVIN0000000001"
+from tests.vin import VIN
+
 ACK = {
     "resultTime": "1786708073269",
     "hasAsy": "0",

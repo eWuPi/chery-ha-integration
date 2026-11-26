@@ -150,6 +150,9 @@ config/
 # Home Assistant secrets
 secrets.yaml
 
+# Local test fixtures — a real vehicle identifier never belongs in the repo
+tests/vin.local
+
 # Ruff
 .ruff_cache/
 

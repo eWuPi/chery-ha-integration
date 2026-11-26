@@ -26,6 +26,8 @@ from custom_components.chery_europe.data import (
 )
 from custom_components.chery_europe.types.vehicle_models import VehicleStatus
 
+from tests.vin import VIN
+
 # ---------------------------------------------------------------------------
 # Dict input — camelCase key variants
 # ---------------------------------------------------------------------------
@@ -637,10 +639,10 @@ def test_vehicle_display_name_prefers_nickname():
 
 
 def test_vehicle_display_name_never_returns_the_vin():
-    data = CheryData(vin="TESTVIN0000000001", vehicle_nickname="TESTVIN0000000001")
+    data = CheryData(vin=VIN, vehicle_nickname=VIN)
 
     assert vehicle_display_name(data) == "Chery Vehicle"
-    assert "TESTVIN0000000001" not in vehicle_display_name(data)
+    assert VIN not in vehicle_display_name(data)
 
 
 def test_scoped_device_lookup_matches_ha_signature():
@@ -786,7 +788,7 @@ def test_registry_names_lose_the_vin():
     from custom_components.chery_europe.const import DOMAIN
     from custom_components.chery_europe.entity import async_drop_vin_from_names
 
-    vin = "TESTVIN0000000001"
+    vin = VIN
     entity = SimpleNamespace(
         entity_id=f"sensor.{vin.lower()}_battery_level",
         unique_id=f"{vin}_battery_level",
