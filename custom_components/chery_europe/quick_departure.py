@@ -171,7 +171,13 @@ class QuickDepartureHeating:
         try:
             await self._call("button", "press", ids.get("wake"))
             await asyncio.sleep(WAKE_DELAY)
-            await self._wait(lambda: self._online(ids), WAKE_TIMEOUT)
+            if ids.get("online") and not await self._wait(
+                lambda: self._online(ids), WAKE_TIMEOUT
+            ):
+                await self._async_finish(
+                    f"auto nie odpowiedziało w {WAKE_TIMEOUT:g} s", restore=False
+                )
+                return
             await self._call("switch", "turn_on", ids.get("heat"))
             early = self._target - WHEEL_LEAD
             if await self._wait(lambda: self._door_open(ids), self._seconds(early)):
@@ -194,13 +200,19 @@ class QuickDepartureHeating:
         finally:
             _LOGGER.debug("Quick departure heating for entry %s finished", hass)
 
-    async def _async_finish(self, reason: str | None, *, error: bool = False) -> None:
+    async def _async_finish(
+        self, reason: str | None, *, error: bool = False, restore: bool = True
+    ) -> None:
         """Put the settings back and tell the user how it ended."""
-        await self.async_restore()
+        if restore:
+            await self.async_restore()
+        else:
+            self._snapshot = None
         if error:
             message = "Sekwencja grzania przerwana błędem - nastawa przywrócona."
         elif reason:
-            message = f"Grzanie przerwane ({reason}), nastawa przywrócona."
+            tail = ", nastawa przywrócona." if restore else "."
+            message = f"Grzanie przerwane ({reason}){tail}"
         else:
             message = (
                 f"Grzanie zakończone, nastawa przywrócona, klimatyzacja wyłączona."

@@ -155,6 +155,11 @@ def _door_waits(*answers: bool):
     return _wait
 
 
+def _waits(*doors: bool):
+    """Let the car answer the wake-up at once, then answer the door waits."""
+    return _door_waits(True, *doors)
+
+
 # --- registry lookup ------------------------------------------------------
 
 
@@ -231,7 +236,7 @@ def test_heating_snapshot_tolerates_entities_that_are_not_there():
 
 async def test_the_sequence_wakes_heats_and_puts_everything_back(fast, notes):
     """The happy path: wake, heat, wheel, seat, then the old settings."""
-    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, False, False))
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _waits(False, False))
     hass = _Hass()
     heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
     await heating.async_start(_snapshot())
@@ -267,7 +272,7 @@ async def test_the_sequence_wakes_heats_and_puts_everything_back(fast, notes):
 
 async def test_a_door_opened_before_the_wheel_stops_the_sequence(fast, notes):
     """Somebody getting in early ends the run before the wheel is switched on."""
-    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, True))
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _waits(True))
     hass = _Hass()
     heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
     await heating.async_start(_snapshot())
@@ -285,7 +290,7 @@ async def test_a_door_opened_before_the_wheel_stops_the_sequence(fast, notes):
 
 async def test_a_door_opened_before_leaving_stops_the_sequence(fast, notes):
     """A door after the wheel and the seat stops the run before the departure."""
-    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, False, True))
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _waits(False, True))
     hass = _Hass()
     heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
     await heating.async_start(_snapshot())
@@ -301,6 +306,7 @@ async def test_a_door_opened_before_leaving_stops_the_sequence(fast, notes):
 
 async def test_a_failing_command_restores_the_settings_and_says_so(fast, notes):
     """A refusal from the car ends the run, restores and reports the error."""
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _waits(False, False))
     hass = _Hass(fail_on=("switch", "turn_on"))
     heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
     await heating.async_start(_snapshot())
@@ -311,15 +317,43 @@ async def test_a_failing_command_restores_the_settings_and_says_so(fast, notes):
     assert ("climate", "turn_off", {"entity_id": "climate.tiggo"}) in hass.services.calls
 
 
-async def test_a_car_that_never_answers_still_gets_the_commands(fast, notes):
-    """The wake timeout does not stop the sequence - the commands go out anyway."""
-    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, False, False))
+async def test_a_car_that_never_answers_stops_before_the_heat(fast, notes):
+    """No answer to the wake-up ends the run instead of driving a sleeping car."""
+    fast.setattr(qd, "WAKE_TIMEOUT", 45)
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False))
+    hass = _Hass()
+    heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
+    await heating.async_start(_snapshot())
+    await heating._task
+
+    assert hass.services.calls == [("button", "press", {"entity_id": "button.tiggo_wake"})]
+    assert "auto nie odpowiedziało w 45 s" in notes[0]["message"]
+    assert heating.snapshot is None
+    assert heating.running is False
+
+
+async def test_a_car_without_the_online_sensor_is_heated_anyway(monkeypatch, fast, notes):
+    """A car that does not report "online" is not mistaken for a sleeping one."""
+    rows = _registry_entries(
+        [
+            ("abc_hvac_climate", "climate.tiggo"),
+            ("abc_heat_everything", "switch.tiggo_grzanie"),
+            ("abc_steering_wheel_heating", "switch.tiggo_kierownica"),
+            ("abc_driver_seat_heating_level_select", "select.tiggo_fotel"),
+        ]
+    )
+    monkeypatch.setattr(qd.er, "async_get", lambda hass: "registry")
+    monkeypatch.setattr(
+        qd.er, "async_entries_for_config_entry", lambda entry, entry_id: rows
+    )
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, False))
     hass = _Hass()
     heating = qd.QuickDepartureHeating(hass, ENTRY, dt_util.now() + timedelta(minutes=15))
     await heating.async_start(_snapshot())
     await heating._task
 
     assert ("switch", "turn_on", {"entity_id": "switch.tiggo_grzanie"}) in hass.services.calls
+    assert "Grzanie zakończone" in notes[0]["message"]
 
 
 # --- lifecycle ------------------------------------------------------------
@@ -365,7 +399,7 @@ async def test_stop_leaves_the_car_alone(fast, notes):
 
 async def test_retarget_keeps_the_snapshot_and_the_old_settings(fast, notes):
     """A second switch-on moves the deadline instead of capturing a new state."""
-    fast.setattr(qd.QuickDepartureHeating, "_wait", _door_waits(False, False, False))
+    fast.setattr(qd.QuickDepartureHeating, "_wait", _waits(False, False))
     hass = _Hass()
     first = dt_util.now() + timedelta(minutes=15)
     heating = qd.QuickDepartureHeating(hass, ENTRY, first)
