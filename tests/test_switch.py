@@ -311,7 +311,9 @@ async def test_setup_keeps_every_switch_when_permissions_are_unknown():
     assert "driver_seat_heating" not in keys
     assert "departure" in keys
     assert "departure_monday" in keys
-    assert len(added) == len(SWITCH_DESCRIPTIONS) + 11
+    # the 15-minute departure action moved here from the button platform
+    assert "departure_in_15_min" in keys
+    assert len(added) == len(SWITCH_DESCRIPTIONS) + 12
 
 
 def test_keep_feature_creates_the_entity_even_when_the_control_is_denied():

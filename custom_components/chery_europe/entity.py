@@ -243,8 +243,6 @@ ENTITY_ID_RENAMES = (
     ("button", "wake", "wybudz_auto", "pojazd_wybudz"),
     ("button", "refresh_full_status", "odswiez_pelny_status", "diagnostyka_odswiez_status"),
     ("button", "refresh_full_status", "status_odswiez", "diagnostyka_odswiez_status"),
-    ("button", "departure_in_15_min", "wyjazd_za_15_minut", "wyjazd_za_15min"),
-    ("button", "departure_in_15_min", "wyjazd_za_15_min", "wyjazd_za_15min"),
     # Ranges, consumption and diagnostics.
     ("sensor", "fuel_level", "pozostale_paliwo", "paliwo_poziom"),
     ("sensor", "range", "zasieg", "zasieg_laczny"),

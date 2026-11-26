@@ -46,31 +46,8 @@ def _patched_registry(updates: list):
 
 
 @pytest.mark.asyncio
-async def test_setup_adds_the_quick_departure_button() -> None:
-    """The quick departure button is created next to the other actions."""
-    added: list = []
-    updates: list = []
-
-    with _patched_registry(updates):
-        await async_setup_entry(
-            Mock(), _entry({}), lambda entities: added.extend(entities)
-        )
-
-    keys = [entity.entity_description.key for entity in added]
-    assert "departure_in_15_min" in keys
-    assert "departure_restore" not in keys
-    button = next(
-        entity
-        for entity in added
-        if entity.entity_description.key == "departure_in_15_min"
-    )
-    assert button.unique_id == "entry-1_departure_in_15_min"
-    assert button.entity_description.icon == "mdi:car-clock"
-
-
-@pytest.mark.asyncio
-async def test_setup_keeps_the_button_when_permissions_are_unknown() -> None:
-    """An unread permission map must not hide the button."""
+async def test_setup_keeps_the_buttons_when_permissions_are_unknown() -> None:
+    """An unread permission map must not hide the remaining buttons."""
     added: list = []
     updates: list = []
 
@@ -80,4 +57,5 @@ async def test_setup_keeps_the_button_when_permissions_are_unknown() -> None:
         )
 
     keys = {entity.entity_description.key for entity in added}
-    assert "departure_in_15_min" in keys
+    # the 15-minute action moved to the switch platform
+    assert "departure_in_15_min" not in keys
